@@ -164,17 +164,22 @@ herdr-app do layout.clone '{"name":"main","as":"my-main"}'
 ```
 
 In `layouts/my-main.json` set the `files` block's `content.mod` to `my-files`.
-In `mods/my-files/main.js` add `run` to the `herdr` import and put this at the
-top of `show(path, cx)`:
+In `mods/my-files/main.js` add `run` and `setShared` to the `herdr` import and
+put this at the top of `show(path, cx)`:
 
 ```js
 if (path && cx && !this.on && /\.(md|markdown|mdx)$/i.test(path)) {
   const file = `${this.root}/${path}`, tab = focused()?.tab;
-  const old = panes().find(p => p.mod === "herdr-md" && p.tab === tab);
-  if (old) run("pane.close", { pane: old.pane });   // close first, or each click halves the pane
-  return run("pane.split", { direction: "right", mod: "herdr-md", props: { file } });
+  const viewers = panes().filter(p => p.mod === "herdr-md" && p.tab === tab);
+  if (viewers.length !== 1) return run("pane.split", { direction: "right", mod: "herdr-md", props: { file } });
+  setShared("herdr-md.open", { file });   // the open viewer shows it in place
+  return run("herdr-md.open");
 }
 ```
+
+`herdr-md.open` works from any mod: set `herdr-md.open` in shared state to
+`{ file }` first. When the shown tab has one local viewer, it opens the file in
+place, and `Backspace` goes back to the one before.
 
 ## For agents: `mdh`
 
@@ -216,14 +221,14 @@ heading, list item, table row, code block). For Claude Code there's a ready skil
 | `O` | open the video under the cursor in QuickTime Player |
 | in a zoomed figure: `h` `j` `k` `l` or drag or scroll · `+` `-` or ctrl-scroll · `0` · `Esc` | pan · zoom (about the pointer) · fit · close |
 | `/` then `Enter` / `Shift-Enter`, `n` `N` | search; next / previous match (or highlight) |
-| `#` | line numbers: absolute → relative (vim hybrid: the cursor shows its line, the rest how many `j`/`k` away) → off |
+| `#` | line numbers: absolute → relative (vim hybrid: the cursor shows its line, the rest how many `j`/`k` away) → off; remembered for every viewer |
 | `C` | cursor look: highlight → number badge → lift → badge + highlight (saved for every viewer) |
 | `B` | cursor motion (default: the number blinks its color, it never moves or vanishes): steady, pulse (number, highlight or both), grow the highlight (alone or with a pulse), blink (number, highlight or both); it stays still while moving |
 | `Esc` | leave visual mode, close search, clear the sent selection |
 | `?` or `h` | key help: `/` searches it (`Enter` back to scrolling, `Esc` clears); `j` `k`, `ctrl-d` `ctrl-u`, `g` `G` or the wheel scroll it; any other key closes it |
 | `q` | close the viewer |
 
-Clicking a heading folds it too.
+Clicking a heading's arrow folds it too.
 
 ## Development
 

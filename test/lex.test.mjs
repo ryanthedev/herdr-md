@@ -251,4 +251,37 @@ t("a paragraph whose lines can't stand alone stays whole", () => {
   assert.equal(statementLines(["just one word", "another"]), true);
 });
 
+t("$$ mid-sentence is inline math and never pairs with a later block's opener", () => {
+  const types = src => marked.lexer(src).filter(x => x.type !== "space").map(x => x.type);
+  const doc = "The parameters $$(v_0, \\theta)$$ are fit\nfrom quotes.\n\n$$\na = b\n$$\n\nText.\n\n$$\nc = d\n$$\n";
+  assert.deepEqual(types(doc), ["paragraph", "math", "paragraph", "math"]);
+  assert.deepEqual(marked.lexer(doc).filter(x => x.type === "math").map(x => x.text), ["a = b", "c = d"]);
+  // A wrapped line can start with inline $$…$$ followed by more text.
+  assert.deepEqual(types("Fit\n$$(v_0)$$ from quotes.\n\n$$\na = b\n$$\n"), ["paragraph", "math"]);
+  assert.deepEqual(types("$$ e^{i\\pi} + 1 = 0 $$\n"), ["math"]);
+  // Chunks agree with the whole-file lex around inline $$.
+  const big = Array.from({ length: 40 }, (_, i) => `Para ${i} with $$x_${i}$$ inline.\n\n$$\ny_${i} = 1\n$$\n`).join("\n");
+  const chunked = lexAll(big, 200);
+  assert.ok(chunked.chunks > 1);
+  assert.equal(chunked.blocks.filter(b => b.type === "math").length, 40);
+});
+
+t("a footnote definition is one block with its indented continuation", () => {
+  const src = "Cites [^1] and [^b].\n\n[^1]: Schadner (2024). [Direct fit](https://doi.org/x).\n    Journal 31(3).\n\n    Same note.\n\n[^b]: Heston (1993).\n\nAfter.\n";
+  const notes = marked.lexer(src).filter(x => x.type === "footnote");
+  assert.deepEqual(notes.map(x => [x.id, x.text]), [["1", "Schadner (2024). [Direct fit](https://doi.org/x).\nJournal 31(3).\n\nSame note."], ["b", "Heston (1993)."]]);
+  assert.deepEqual(lexAll(src).blocks.map(b => b.type), ["paragraph", "footnote", "footnote", "paragraph"]);
+  const big = Array.from({ length: 40 }, (_, i) => `Para ${i} [^${i}].\n\n[^${i}]: Note ${i}\n    continued.\n`).join("\n");
+  assert.equal(lexAll(big, 200).blocks.filter(b => b.type === "footnote").length, 40);
+});
+
+t("a $$ formula wrapped across lines stays inline and leaves the next block alone", () => {
+  const doc = "Fit\n$$(v_0,\n\\theta)$$ are fit.\n\nMore text.\n\n$$\na=b\n$$\n";
+  const toks = marked.lexer(doc).filter(x => x.type !== "space");
+  assert.deepEqual(toks.map(x => x.type), ["paragraph", "paragraph", "math"]);
+  assert.equal(toks[2].text, "a=b");
+  const big = Array.from({ length: 40 }, (_, i) => `Fit\n$$(v_${i},\n\\theta)$$ fit.\n\n$$\ny_${i} = 1\n$$\n`).join("\n");
+  assert.equal(lexAll(big, 200).blocks.filter(b => b.type === "math").length, 40);
+});
+
 console.log(`${n} passed`);

@@ -15,9 +15,9 @@
 // videos are copied here (base64 over exec) because the app only draws local files.
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView, InputState, Input } from "gpui-base";
-import { props, readTextFile, watchFolder, exec, theme, settings, home, appHome, nextCommand, panes, spaces, focused, run } from "herdr";
+import { props, readTextFile, watchFolder, exec, theme, settings, home, appHome, nextCommand, panes, spaces, focused, run, shared } from "herdr";
 import { marked, splitChunks, capSource, refDefs, lexChunk, blocks, LEX_MAX } from "./lex.js";
-import { inlineMath } from "./tex.js";
+import { inlineMath, splitInline, texToUnicode } from "./tex.js";
 import { hash as bhash, diffBlocks, slug, labelOf, inlineRoles, alertOf, ALERTS, nextNumberMode, ordinals, gutterLabel, nextLook, nextMotion, parseCursorPref, cursorParts, LOOK_NAMES } from "./doc.js";
 import { listFiles, parseRecent, pushRecent, rank, runs, previewSource, parseConfig, layoutOf, sizeOf, within, shape, shorten } from "./picker.js";
 import { VIDEO_FPS, stopped, command, tick } from "./video.js";
@@ -34,7 +34,11 @@ const isMath = tok => tok.type === "math" || (tok.type === "code" && /^(math|lat
 // Body text in the person's terminal font (BerkeleyMono), falling back to Geist.
 const BODY = () => settings().font_family || "Geist";
 const SIZE = { body: 15, h1: 34, h2: 26, h3: 21, h4: 18, h5: 16, h6: 15 };
+// MathJax lays math out in ex, at half an em: this sets display math to the body text size.
+const MATH_EX = SIZE.body / 2;
 const MAX_W = 960, PAD = 64, TOP = 28;
+// The height assumed for a row not yet measured; a spacer() takes it too, so positions agree.
+const ROW_GUESS = 40;
 // Scroll animation, done natively by GPUI's transition on the content's `top`:
 // a long glide for jumps (highlights, search, headings, gg/G), short for j/k and the wheel.
 // A new agent note waits for the glide, fades in, then types itself out.
@@ -51,7 +55,7 @@ const HELP = [[
 ], [
   ["READ", [["ctrl-p", "find a markdown file, with preview (ctrl-f: folders, ctrl-g: up a folder)"], ["o", "outline"], ["Enter", "fold a heading, follow a link, zoom a figure, play a video"], ["O", "open a video in QuickTime"], ["Backspace", "back after a link"],
     ["za zc zo", "toggle / close / open fold"], ["zM zR", "fold / unfold all"], ["] [", "next / previous change"], ["c", "clear change marks"],
-    ["/", "search"], ["n N", "next / previous match or note"], ["#", "line numbers: absolute, relative, off"],
+    ["/", "search"], ["n N", "next / previous match or note"], ["#", "line numbers: absolute, relative, off (remembered)"],
     ["C", "cursor look: highlight, number badge, lift"], ["B", "cursor motion: blink (default), steady, pulse, grow"]]],
   ["ZOOM (Enter on a diagram or image)", [["h j k l", "pan (or drag, or scroll)"], ["+ -", "zoom in / out (or ctrl-scroll)"], ["0", "fit"], ["Esc", "close"]]],
   ["VIEWER", [["? h", "this help"], ["q", "close the viewer"]]],
@@ -156,6 +160,7 @@ export default class Md extends View {
     this.notes = { highlights: [] }; this.seq = null; this.pendingFocus = null; this.aim = null;
     this.folded = new Set(); this.hidden = []; this.ord = [];
     this.labels = new Map(); this.anchors = new Map(); this.changed = new Set(); this.removed = new Map(); this.lastHashes = null;
+    this.eqX = new Map(); this.inlineJobs = []; this.inlineBusy = false; this.flows = new Map();
     this.history = []; this.pendingAnchor = null; this.restore = null; this.outline = false; this.oi = 0; this.watchGen = 0;
     this.help = false; this.helpIn = 0; this.zoom = null; this.viewW = 0;
     this.query = ""; this.matches = []; this.mi = 0; this.searching = false; this.typing = false;
@@ -196,7 +201,7 @@ export default class Md extends View {
     const p = props(), explicit = p && "machine" in p ? p.machine : undefined;
     this.ready = this.locate(machineCandidates({ explicit, focusedTab: focused()?.tab, spaces: spaces(), panes: panes(), mod: MOD }));
     this.remember(this.file);
-    readTextFile(CURSOR_PREF()).catch(() => null).then(text => { const p = parseCursorPref(text); this.look = p.look; this.cmotion = p.motion; cx.notify(); });
+    readTextFile(CURSOR_PREF()).catch(() => null).then(text => { const p = parseCursorPref(text); this.look = p.look; this.cmotion = p.motion; this.numbers = p.numbers; cx.notify(); });
     this.load(cx);
     this.watch(cx);
     this.watchNotes(cx);
@@ -215,6 +220,13 @@ export default class Md extends View {
           if (this.pick) continue;
           if (this.handle.is_focused() || this.typing) this.openPicker(cx);
           else if (mine.length === 1) { run("pane.focus", { pane: mine[0].pane }); this.openPicker(cx); }
+          continue;
+        }
+        // `herdr-md.open` after setShared("herdr-md.open", { file }): the shown tab's
+        // only viewer shows that local file in place. A remote viewer ignores it.
+        if (c === "open") {
+          const req = shared("herdr-md.open"), tab = focused()?.tab, mine = panes().filter(p => p.mod === MOD && p.tab === tab);
+          if (req?.file && mine.length === 1 && !this.on) this.navigate(req.file, null, cx, true);
           continue;
         }
         if (c !== "focus") continue;
@@ -387,8 +399,10 @@ export default class Md extends View {
   // Drop d2l label paragraphs (they name the block before them), number labeled
   // equations, and index heading anchors for #links.
   index(list) {
-    const out = [], labels = new Map(), anchors = new Map(); let eq = 0;
+    const out = [], labels = new Map(), anchors = new Map(), refs = new Map(); let eq = 0;
     for (const b of list) {
+      if (b.type !== "footnote" && b.type !== "code") for (const m of (b.raw ?? "").replace(/(`+)[\s\S]*?\1/g, "").matchAll(/\[\^([^\]\s]+)\](?!:)/g)) if (!refs.has(m[1])) refs.set(m[1], out.length);
+      if (b.type === "footnote" && !labels.has(`^${b.id}`)) labels.set(`^${b.id}`, { block: out.length, title: b.id, note: b });
       const l = labelOf(b);
       if (l) {
         // A table's label names the whole table: its first row.
@@ -404,6 +418,10 @@ export default class Md extends View {
       if (b.type === "heading") { let a = slug(plain(b.tokens)), k = a, n = 1; while (anchors.has(k)) k = `${a}-${n++}`; anchors.set(k, out.length); }
       out.push(b);
     }
+    // Notes are numbered in the order they are first cited, as on GitHub; uncited ones come last.
+    let note = 0;
+    for (const [id, block] of refs) { const l = labels.get(`^${id}`); if (l) { l.ref = block; l.num = l.note.num = ++note; } }
+    for (const l of labels.values()) if (l.note && l.num === undefined) l.num = l.note.num = ++note;
     this.labels = labels; this.anchors = anchors;
     return out;
   }
@@ -444,6 +462,7 @@ export default class Md extends View {
   }
 
   follow(url, cx) {
+    if (url.startsWith("#fnback:")) return this.footnoteBack(decodeURIComponent(url.slice(8)), cx);
     if (url.startsWith("#")) {
       this.history.push({ file: this.file, cursor: this.cursor });
       this.jumpAnchor(url.slice(1)); return cx.notify();
@@ -464,10 +483,22 @@ export default class Md extends View {
     if (push && this.file) this.history.push({ file: this.file, cursor: this.cursor });
     if (file === this.file) { if (frag) this.jumpAnchor(frag); return cx.notify(); }
     this.file = file.replace(/\/[^/]+\/\.\.\//g, "/"); this.remember(this.file);
-    this.folded.clear(); this.offset = 0; this.motion = 0; this.cursor = 0; this.anchor = null;   // heights kept: see load()
+    // Another file's heights would size its far rows, which spacers never re-measure.
+    this.folded.clear(); this.offset = 0; this.motion = 0; this.cursor = 0; this.anchor = null; this.heights = [];
+    this.eqX.clear(); this.flows.clear();
     this.lastHashes = null; this.changed = new Set(); this.removed = new Map(); this.seq = null; this.aim = null;
     this.pendingAnchor = frag;
     this.load(cx); this.watch(cx); this.readNotes(cx);
+  }
+
+  // A footnote's ↩: back to the reference that was followed here, else to the first one.
+  footnoteBack(id, cx) {
+    const h = this.history[this.history.length - 1], ref = new RegExp(`\\[\\^${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\](?!:)`);
+    if (h?.file === this.file && ref.test(this.blocks[h.cursor]?.raw ?? "")) return this.back(cx);
+    const i = this.labels.get(`^${id}`)?.ref;
+    if (i === undefined) return;
+    this.history.push({ file: this.file, cursor: this.cursor });
+    this.cursor = i; this.aimAt(i); cx.notify();
   }
 
   back(cx) {
@@ -572,7 +603,7 @@ export default class Md extends View {
     const i = this.aim;
     if (i === null || i === undefined) return;
     let y = TOP;
-    for (let j = 0; j < i; j++) { if (this.hidden[j]) continue; if (this.heights[j] === undefined) return; y += this.heights[j]; }
+    for (let j = 0; j < i; j++) if (!this.hidden[j]) y += this.heights[j] ?? ROW_GUESS;
     const to = this.clamp(y - Math.min(120, this.viewH / 4));
     if (Math.abs(to - this.offset) > 2) this.motion = GLIDE;
     this.offset = to;
@@ -606,7 +637,7 @@ export default class Md extends View {
       if (this.hidden[i]) continue;
       if (y > this.offset + 40) break;
       if (this.blocks[i].type === "heading") last = i;
-      y += this.heights[i] ?? 0;
+      y += this.heights[i] ?? ROW_GUESS;
     }
     return last;
   }
@@ -628,6 +659,24 @@ export default class Md extends View {
   closeSearch(cx) { this.searching = false; this.input.set_value(""); this.search(""); this.handle.focus(); cx.notify(); }
 
   clamp(y) { return Math.max(0, Math.min(y, Math.max(0, this.contentH - this.viewH))); }
+
+  // The scrollbar: a press on the thumb drags it, a press on the track jumps there first.
+  grabBar(e, thumbH, thumbY, cx) {
+    const y = (e.local_position?.y ?? 0) / Z();
+    if (y < thumbY || y > thumbY + thumbH) {
+      this.aim = null; this.motion = 0;
+      this.offset = this.clamp((y - thumbH / 2) * (this.contentH - this.viewH) / (this.viewH - thumbH));
+    }
+    this.barDrag = { y, offset: this.offset };
+    this.handle.focus(); cx.notify();
+  }
+
+  dragBar(e, thumbH, cx) {
+    const y = (e.local_position?.y ?? e.position.y) / Z(), d = this.barDrag;
+    this.aim = null; this.motion = 0;
+    this.offset = this.clamp(d.offset + (y - d.y) * (this.contentH - this.viewH) / (this.viewH - thumbH));
+    cx.notify();
+  }
 
   scrollBy(dy, cx) { this.aim = null; this.motion = NUDGE; const o = this.clamp(this.offset + dy); if (o !== this.offset) { this.offset = o; cx.notify(); } }
 
@@ -824,7 +873,7 @@ export default class Md extends View {
 
   figKey(tok) {
     const t = theme();
-    return fnv(JSON.stringify([isMath(tok) ? "m" : "d", tok.text, t.foreground, t.surface, settings().font_family, 1]));
+    return fnv(JSON.stringify([isMath(tok) ? "m" : "d", tok.text, t.foreground, t.surface, settings().font_family, isMath(tok) ? MATH_EX : 1]));
   }
 
   // What figures are drawn with: a change (a theme switch) renders them again.
@@ -846,7 +895,7 @@ export default class Md extends View {
       else waiting.push([tok, key]);
       if (this.figs[key]?.path || this.figs[key]?.error || this.figs[key]?.pending) return;
       this.figs[key] = { pending: true };
-      jobs.push({ kind: isMath(tok) ? "math" : "mermaid", src: tok.text, out: `${root}/${key}.${isMath(tok) ? "svg" : "png"}`, color: t.foreground, exPx: 11, font,
+      jobs.push({ kind: isMath(tok) ? "math" : "mermaid", src: tok.text, out: `${root}/${key}.${isMath(tok) ? "svg" : "png"}`, color: t.foreground, exPx: MATH_EX, font,
         colors: { fg: t.foreground, surface: t.surface, raised: t.raised, bg: t.background, blue: t.ansi4, purple: t.ansi5, dim: t.dim } });
     });
     if (!jobs.length) { for (const [tok, key] of waiting) tok.fig = key; return; }
@@ -867,14 +916,15 @@ export default class Md extends View {
   // (MathJax and mermaid-cli; Chrome itself is not downloaded).
   async runRenderer(jobs) {
     const dir = `${appHome()}/mods/${MOD}/render`;
-    if (!this.deps) {
+    // One promise, so figures and inline formulas met together share one npm install.
+    this.deps ??= (async () => {
       const has = await exec("test", ["-d", `${dir}/node_modules/mathjax-full`]);
       if (has.code !== 0) {
         const i = await exec("sh", ["-c", 'cd "$1" && PUPPETEER_SKIP_DOWNLOAD=1 npm install --no-audit --no-fund --silent', "install", dir]);
         if (i.code !== 0) throw new Error(`npm install failed (Node.js and npm are needed): ${(i.stderr || "").slice(0, 160)}`);
       }
-      this.deps = true;
-    }
+    })();
+    try { await this.deps; } catch (e) { this.deps = null; throw e; }
     return exec("node", [`${dir}/render.mjs`, jobs]);
   }
 
@@ -886,6 +936,24 @@ export default class Md extends View {
     const f = (live?.path ? live : this.figs[tok.fig]) ?? { pending: true }, math = isMath(tok);
     if (f.path) {
       const max = this.colW - (math ? 0 : 34);
+      // Equations keep one size, as on GitHub: a wide one scrolls sideways instead of shrinking.
+      // Not overflow_x_scroll: GPUI turns vertical wheel moves into horizontal ones
+      // there, so the page would stop scrolling under the pointer.
+      if (math && f.w > max) {
+        const room = max - (tok.eqNum ? 48 : 0), x = Math.min(this.eqX.get(id) ?? 0, f.w - room);
+        return h_flex().w_full().items_center().py(10).gap(8)
+          .child(div().id(`${id}-x`).relative().flex_1().min_w(0).h(f.h + 8).overflow_hidden()
+            .on_scroll_wheel((e, cx) => {
+              // macOS already turns shift-wheel into a horizontal delta; elsewhere it stays vertical.
+              const dx = e.delta.x || (e.modifiers?.shift ? e.delta.y : 0);
+              if (Math.abs(dx) <= Math.abs(e.delta.x ? e.delta.y : 0)) return;
+              cx.stop_propagation();
+              this.eqX.set(id, Math.max(0, Math.min(f.w - room, (this.eqX.get(id) ?? 0) - dx / Z()))); cx.notify();
+            })
+            .child(image(f.path).absolute().top(0).left(-x).w(f.w).h(f.h))
+            .child(div().absolute().bottom(0).h(3).rounded(2).bg(t.border).left(x / f.w * room).w(room * room / f.w)))
+          .when(Boolean(tok.eqNum), el => el.child(div().flex_none().text_size(13).text_color(t.dim).child(`(${tok.eqNum})`)));
+      }
       let w = f.w, h = f.h; if (w > max) { h = Math.round(h * max / w); w = max; }
       return math
         ? h_flex().w_full().items_center().py(10)
@@ -899,11 +967,103 @@ export default class Md extends View {
       .child(div().px(12).pb(8).text_size(13).text_color(t.muted).child(tok.text));
   }
 
-  inline(id, md) {
+  inline(id, md, ex = MATH_EX) {
     const pv = this.pvMode;   // a preview's links go nowhere (they'd move the viewer)
-    return TextView.markdown(id, inlineMath(inlineRoles(md, pv ? new Map() : this.labels))).selectable(!pv)
-      .on_link_click((url, cx) => { if (!pv) this.follow(url, cx); });
+    const linked = inlineRoles(md, pv ? new Map() : this.labels);
+    // TextView loads no local images, so text with formulas is laid out here
+    // once every formula is typeset; until then the formulas show as Unicode.
+    const parts = pv ? [] : splitInline(linked);
+    if (parts.some(p => p.tex !== undefined)) {
+      const figs = parts.map(p => p.tex === undefined ? null : this.inlineFormula(p.tex, ex));
+      if (parts.every((p, k) => p.tex === undefined || figs[k])) return this.mathFlow(id, parts, figs, ex);
+    }
+    return TextView.markdown(id, inlineMath(linked)).selectable(!pv)
+      .on_link_click((url, cx) => {
+        if (pv) return;
+        this.followFrom(id, url, cx);
+      });
   }
+
+  // A clicked footnote reference becomes the cursor, so the note's ↩ comes back to it.
+  followFrom(id, url, cx) {
+    const b = /^b(\d+)/.exec(id);
+    if (b && url.startsWith("#label:%5E")) this.cursor = Number(b[1]);
+    this.follow(url, cx);
+  }
+
+  // Text and typeset formulas as one wrapping line of words: markdown styles
+  // (bold, italic, code, strike, links) and hard breaks carry over. Unlike
+  // TextView, the words can't be selected.
+  mathFlow(id, parts, figs, ex) {
+    const t = theme(), gap = ex * 1.1;
+    const src = parts.map((p, k) => p.tex === undefined ? p.text : `\uE000${k}\uE001`).join("");
+    let atoms = this.flows.get(src);
+    const walk = (tokens, style) => {
+      for (const tok of tokens) {
+        if (tok.type === "strong") walk(tok.tokens, { ...style, bold: true });
+        else if (tok.type === "em") walk(tok.tokens, { ...style, italic: true });
+        else if (tok.type === "del") walk(tok.tokens, { ...style, strike: true });
+        else if (tok.type === "link") walk(tok.tokens, { ...style, href: tok.href });
+        else if (tok.type === "codespan") words(tok.text, { ...style, code: true });
+        else if (tok.type === "br") atoms.push({ br: true, style });
+        else if (tok.tokens) walk(tok.tokens, style);
+        else words(tok.type === "image" ? tok.text : (tok.text ?? tok.raw ?? ""), style);
+      }
+    };
+    const words = (text, style) => {
+      for (const piece of text.split(/(\s+|\uE000\d+\uE001)/)) {
+        if (!piece) continue;
+        if (/^\s+$/.test(piece)) { if (atoms.length) atoms[atoms.length - 1].space = true; continue; }
+        const fig = /^\uE000(\d+)\uE001$/.exec(piece);
+        atoms.push(fig ? { fig: Number(fig[1]), style } : { word: piece, style });
+      }
+    };
+    if (!atoms) { atoms = []; walk(marked.Lexer.lexInline(src), {}); this.flows.set(src, atoms); }
+    // A line may break only where the source has a space: pieces that touch
+    // (a formula and its comma, code and a semicolon) stay together.
+    const units = [[]];
+    atoms.forEach((a, k) => { if (a.br) { units.push([[a, k]], []); return; } units[units.length - 1].push([a, k]); if (a.space) units.push([]); });
+    return h_flex().w_full().flex_wrap().items_center().children(units.filter(w => w.length).map(w => w[0][0].br ? div().w_full().h(0) :
+      h_flex().flex_none().items_center().when(Boolean(w[w.length - 1][0].space), e => e.mr(gap)).children(w.map(([a, k]) => {
+      const s = a.style, fig = a.fig === undefined ? null : figs[a.fig];
+      const el = fig ? image(fig.path).flex_none().w(fig.w).h(fig.h)
+        : div().flex_none().child(a.word)
+          .when(Boolean(s.bold), e => e.font_weight(700)).when(Boolean(s.italic), e => e.italic()).when(Boolean(s.strike), e => e.line_through())
+          .when(Boolean(s.code), e => e.px(3).rounded(4).bg(t.surface).font_family(settings().font_family || "monospace"));
+      return el.when(Boolean(s.href), e => e.id(`${id}-lnk-${k}`).cursor_pointer().text_color(t.accent).on_click((_e, cx) => this.followFrom(id, s.href, cx)));
+    }))));
+  }
+
+  // An inline formula's typeset image ({ path, w, h }), or null while it renders
+  // or if it failed: the text shows it as Unicode then.
+  inlineFormula(tex, ex) {
+    const key = fnv(JSON.stringify(["i", tex, theme().foreground, ex])), f = this.figs[key];
+    if (f) return f.path ? f : null;
+    this.figs[key] = { pending: true };
+    this.inlineJobs.push({ kind: "math", inline: true, src: tex, out: `${appHome()}/${FIG}/${key}.svg`, color: theme().foreground, exPx: ex });
+    // One worker drains the queue, so a screenful of formulas is a few node runs, not one each.
+    if (!this.inlineBusy && this.renderCx) {
+      this.inlineBusy = true;
+      this.renderCx.spawn(async cx => {
+        try {
+          await null;   // let the rest of this frame queue its formulas first
+          while (this.inlineJobs.length) {
+            const jobs = this.inlineJobs; this.inlineJobs = [];
+            const keyOf = j => j.out.split("/").pop().replace(/\.svg$/, "");
+            try {
+              await exec("mkdir", ["-p", `${appHome()}/${FIG}`]);
+              const r = await this.runRenderer(JSON.stringify(jobs));
+              if (r.code !== 0 || !r.stdout) throw new Error((r.stderr || `renderer exited ${r.code}`).trim().split("\n").pop());
+              for (const res of JSON.parse(r.stdout)) this.figs[keyOf(res)] = res.error ? { error: res.error } : { path: `${FIG}/${res.out.split("/").pop()}`, w: res.w, h: res.h };
+            } catch (e) { for (const j of jobs) this.figs[keyOf(j)] = { error: String(e) }; }
+            cx.notify();
+          }
+        } finally { this.inlineBusy = false; }
+      });
+    }
+    return null;
+  }
+
 
   picture(tok, id, t) {
     // In the picker's preview: a light placeholder (images load when the file opens).
@@ -927,7 +1087,8 @@ export default class Md extends View {
         .child(item.task ? (item.checked ? "✓" : "○") : ordered ? `${n}.` : "•"))
       .child(v_flex().flex_1().min_w(0).when(item.task && item.checked, el => el.text_color(t.dim))
         .children(item.tokens.filter(c => c.type !== "checkbox").map((c, k) => c.type === "text"
-          ? this.inline(`${id}-${k}`, c.raw.replace(/^\[[ xX]\]\s*/, "").trim())
+          // A soft line break is a space; TextView would draw the indented continuation line as a new paragraph.
+          ? this.inline(`${id}-${k}`, c.raw.replace(/^\[[ xX]\]\s*/, "").trim().replace(/(?<! {2}|\\)\n[^\S\n]*/g, " "))
           : this.block(c, `${i}-${k}`, t))));
   }
 
@@ -937,12 +1098,13 @@ export default class Md extends View {
       case "heading": {
         const color = [t.ansi4, t.ansi5, t.ansi6, t.ansi2, t.ansi3, t.muted][tok.depth - 1];
         const pv = this.pvMode, folded = !pv && this.folded.has(i), n = folded ? this.sectionSize(i) : 0;
-        return h_flex().id(`fold-${i}`).items_center().gap(10).when(!pv, el => el.cursor_pointer()).pt(tok.depth <= 2 ? 22 : 14).pb(tok.depth <= 2 ? 10 : 4)
+        return h_flex().id(`fold-${i}`).items_center().gap(10).pt(tok.depth <= 2 ? 22 : 14).pb(tok.depth <= 2 ? 10 : 4)
           .text_size(SIZE[`h${tok.depth}`]).font_weight(tok.depth <= 2 ? 700 : 600).text_color(color)
           .when(tok.depth <= 2, el => el.border_b(1).border_color(t.border).mb(6))
-          .on_click((_e, cx) => { if (!pv) { this.toggleFold(i); cx.notify(); } })
-          .when(!pv, el => el.child(div().w(14).ml(-24).flex_none().text_size(13).text_color(folded ? color : t.border).child(folded ? "▸" : "▾")))
-          .child(div().flex_1().min_w(0).child(plain(tok.tokens)))
+          // The heading's text is selectable, so only its arrow folds on a click (za still folds anywhere).
+          .when(!pv, el => el.child(div().id(`fold-arrow-${i}`).cursor_pointer().w(14).ml(-24).flex_none().text_size(13).text_color(folded ? color : t.border)
+            .on_click((_e, cx) => { this.toggleFold(i); cx.notify(); }).child(folded ? "▸" : "▾")))
+          .child(div().flex_1().min_w(0).child(this.inline(`${id}-h`, tok.text.replace(/\s*\n\s*/g, " ").replace(/^(\d+)([.)])(?=\s|$)/, "$1\\$2").replace(/^([-+*>#])/, "\\$1"), MATH_EX * SIZE[`h${tok.depth}`] / SIZE.body)))
           .when(folded, el => el.child(div().flex_none().text_size(13).font_weight(400).text_color(t.dim).child(`${n} block${n === 1 ? "" : "s"} folded`)));
       }
       case "paragraph": {
@@ -995,6 +1157,11 @@ export default class Md extends View {
       case "trow":
         // One row of a top-level table; its frame and stripes are drawn by row().
         return this.tableRow(tok.table, tok.r, id, t);
+      case "footnote":
+        return h_flex().items_start().gap(8).py(2).text_size(13)
+          .child(div().w(22).flex_none().text_right().text_color(t.dim).child(`${tok.num ?? tok.id}.`))
+          .child(div().flex_1().min_w(0).text_color(t.muted).child(this.inline(id,
+            this.pvMode || this.labels.get(`^${tok.id}`)?.ref === undefined ? tok.text : `${tok.text} [↩](#fnback:${encodeURIComponent(tok.id)})`)));
       case "html":
         if (isComment(tok)) return div();
         return div().py(2).text_size(13).text_color(t.dim).child(tok.raw.trim());
@@ -1015,8 +1182,11 @@ export default class Md extends View {
     const avail = this.colW - 2;
     if (tok.widths?.avail === avail) return tok.widths.weight;
     const ch = SIZE.body * 0.62, padX = 24 + 6, all = c => [tok.header[c], ...tok.rows.map(r => r[c])];
-    const cols = tok.header.map((_h, c) => all(c).map(x => plain(x?.tokens) || x?.text || ""));
-    const words = tok.header.map((_h, c) => all(c).map(x => solid(x?.tokens) || x?.text || ""));
+    // A formula is as wide as what it draws, not its TeX source, and never wraps inside.
+    const shown = x => splitInline(x?.text ?? "").map(q => q.tex === undefined ? plainNote(q.text) : texToUnicode(q.tex).replace(/\s/g, "\u00a0")).join("");
+    const hasMath = x => /\$/.test(x?.text ?? "");
+    const cols = tok.header.map((_h, c) => all(c).map(x => hasMath(x) ? shown(x) : plain(x?.tokens) || x?.text || ""));
+    const words = tok.header.map((_h, c) => all(c).map(x => hasMath(x) ? shown(x) : solid(x?.tokens) || x?.text || ""));
     const min = words.map(xs => padX + ch * Math.max(1, ...xs.flatMap(s => s.split(/\s+/).map(w => [...w].length))));
     const max = cols.map((xs, c) => Math.max(min[c], padX + ch * Math.max(...xs.map(s => [...s.trim()].length))));
     const sum = a => a.reduce((x, y) => x + y, 0);
@@ -1047,6 +1217,16 @@ export default class Md extends View {
   }
 
   // One top-level block, measured, with its highlight tint and note.
+  // A row far from the view, as empty space of its last measured height (with
+  // the margins row() gives it): scrolling rebuilds only the rows near the view.
+  spacer(tok, i) {
+    if (this.hidden[i]) return div();
+    const tr = tok.type === "trow", pl = tok.type === "pline";
+    return div().id(`row-${i}`).flex_none().h(this.heights[i] ?? ROW_GUESS)
+      .when(tr && Boolean(tok.first), el => el.mt(8)).when(tr && Boolean(tok.last), el => el.mb(8))
+      .when(pl && Boolean(tok.first), el => el.mt(4)).when(pl && Boolean(tok.last), el => el.mb(4));
+  }
+
   row(tok, i, t) {
     if (this.hidden[i]) return div();
     const m = this.marks?.get(i);
@@ -1071,7 +1251,14 @@ export default class Md extends View {
       .when(this.numbers !== "off", el => el.child(h_flex().justify_end().absolute().left(-PAD - 12).top(numTop).w(PAD - 14).font_family(BODY()).text_size(12).line_height(1.6)
         .text_color(cur ? t.accent : t.dim).when(cur, el => el.font_semibold())
         .child(numLabel(i, cur ? cp : null, gutterLabel(this.numbers, i, this.cursor, tok.from, this.ord), t))))
-      .on_size_change((size, cx) => { if (this.heights[i] !== size.height / Z()) { this.heights[i] = size.height / Z(); this.reaim(); cx.notify(); } })
+      .on_size_change((size, cx) => {
+        const h = size.height / Z(), was = this.heights[i];
+        if (was === h) return;
+        // A row above the view that grows or shrinks (first measured, or reflowed)
+        // moves the view by as much, so the text being read stays still.
+        if (this.aim === null && this.yOf(i) + (was ?? ROW_GUESS) <= this.offset) { this.offset = this.clamp(this.offset + h - (was ?? ROW_GUESS)); this.motion = 0; }
+        this.heights[i] = h; this.reaim(); cx.notify();
+      })
       .child(div().id(`blk-${i}`).relative()
         .when(!tr, el => el.px(14).mx(-14).rounded(6))
         // A table row draws its piece of the table's frame, and its stripe under
@@ -1654,22 +1841,22 @@ export default class Md extends View {
   }
 
   // ---- cursor ----
-  yOf(i) { let y = TOP; for (let j = 0; j < i; j++) if (!this.hidden[j]) y += this.heights[j] ?? 0; return y; }
+  yOf(i) { let y = TOP; for (let j = 0; j < i; j++) if (!this.hidden[j]) y += this.heights[j] ?? ROW_GUESS; return y; }
 
   move(i, d) { let j = i; for (;;) { const n = j + d; if (n < 0 || n >= this.blocks.length) return j; j = n; if (!this.hidden[j]) return j; } }
 
   // The first block on screen, for when the cursor was scrolled away from.
   firstOnScreen() {
     let y = TOP;
-    for (let i = 0; i < this.blocks.length; i++) { if (this.hidden[i]) continue; const h = this.heights[i] ?? 0; if (y + h > this.offset + 10) return i; y += h; }
+    for (let i = 0; i < this.blocks.length; i++) { if (this.hidden[i]) continue; const h = this.heights[i] ?? ROW_GUESS; if (y + h > this.offset + 10) return i; y += h; }
     return 0;
   }
 
-  onScreen(i) { const y = this.yOf(i), h = this.heights[i] ?? 0; return y + h > this.offset && y < this.offset + this.viewH; }
+  onScreen(i) { const y = this.yOf(i), h = this.heights[i] ?? ROW_GUESS; return y + h > this.offset && y < this.offset + this.viewH; }
 
   setCursor(i, cx, center) {
     this.cursor = Math.max(0, Math.min(i, this.blocks.length - 1)); this.aim = null;
-    const y = this.yOf(this.cursor), h = this.heights[this.cursor] ?? 0, m = 60, from = this.offset;
+    const y = this.yOf(this.cursor), h = this.heights[this.cursor] ?? ROW_GUESS, m = 60, from = this.offset;
     if (center) this.offset = this.clamp(y + h / 2 - this.viewH / 2);
     else if (y < this.offset + m || h > this.viewH - 2 * m) this.offset = this.clamp(y - m);
     else if (y + h > this.offset + this.viewH - m) this.offset = this.clamp(y + h - this.viewH + m);
@@ -1680,7 +1867,7 @@ export default class Md extends View {
   // Move by about `px` pixels of content, block by block.
   moveBy(px, cx) {
     let i = this.cursor, gone = 0; const d = Math.sign(px);
-    while (gone < Math.abs(px)) { const n = this.move(i, d); if (n === i) break; gone += this.heights[d > 0 ? i : n] ?? 40; i = n; }
+    while (gone < Math.abs(px)) { const n = this.move(i, d); if (n === i) break; gone += this.heights[d > 0 ? i : n] ?? ROW_GUESS; i = n; }
     this.offset = this.clamp(this.offset + px); this.setCursor(i, cx); this.motion = 200;
   }
 
@@ -1717,7 +1904,7 @@ export default class Md extends View {
   }
 
   saveCursor() {
-    exec("sh", ["-c", 'mkdir -p "$1" && printf %s "$2" > "$1/.cursor.$$" && mv -f "$1/.cursor.$$" "$1/cursor.json"', "cursor", NOTES(), JSON.stringify({ look: this.look, motion: this.cmotion })]);
+    exec("sh", ["-c", 'mkdir -p "$1" && printf %s "$2" > "$1/.cursor.$$" && mv -f "$1/.cursor.$$" "$1/cursor.json"', "cursor", NOTES(), JSON.stringify({ look: this.look, motion: this.cmotion, numbers: this.numbers })]);
   }
 
   yank() { const { text } = this.selection(); exec("sh", ["-c", 'printf %s "$1" | LANG=en_US.UTF-8 pbcopy', "yank", text]); this.flash = "copied"; }
@@ -1746,8 +1933,11 @@ export default class Md extends View {
       return;
     }
     const mod = e.modifiers ?? {};
-    if (mod.platform || mod.alt) return;
-    const k = mod.shift && e.key.length === 1 ? (e.key_char ?? e.key.toUpperCase()) : e.key;
+    // Option types a character on many layouts (# is Option-3 on a UK or German Mac):
+    // that character is the key; any other Option chord stays the app's.
+    const typed = mod.alt && !mod.platform && !mod.control && e.key_char?.length === 1 ? e.key_char : null;
+    if (mod.platform || (mod.alt && !typed)) return;
+    const k = typed ?? (mod.shift && e.key.length === 1 ? (e.key_char ?? e.key.toUpperCase()) : e.key);
     if (this.help) { if (!MODIFIER_KEYS.includes(e.key)) this.helpKeys(k, mod, cx); return cx.stop_propagation(); }
     if (this.zoom) return this.zoomKeys(k, mod, cx);
     const half = Math.max(80, this.viewH / 2), page = Math.max(100, this.viewH - 80);
@@ -1810,7 +2000,7 @@ export default class Md extends View {
         else if (this.searching) return this.closeSearch(cx);
         else { this.picked = null; const nd = this.notesDir(); if (nd) this.ex("rm", ["-f", `${nd}/selection.json`]).catch(() => {}); }
         return cx.notify();
-      case "#": this.numbers = nextNumberMode(this.numbers); this.flash = `line numbers: ${this.numbers}`; return cx.notify();
+      case "#": this.numbers = nextNumberMode(this.numbers); this.flash = `line numbers: ${this.numbers}`; this.saveCursor(); return cx.notify();
       case "C": this.look = nextLook(this.look); this.flash = `cursor: ${LOOK_NAMES[this.look]} · C next look · B motion`; this.saveCursor(); return cx.notify();
       case "B": this.cmotion = nextMotion(this.cmotion); this.flash = `cursor motion: ${this.cmotion} · B next · C look`; this.resting = true; this.saveCursor(); return cx.notify();
       case "O": return this.openVideo(cx);
@@ -1832,6 +2022,20 @@ export default class Md extends View {
   sectionOf(i) { for (let j = Math.min(i, this.blocks.length - 1); j >= 0; j--) if (this.blocks[j]?.type === "heading") return j; return null; }
 
   render(cx) {
+    this.renderCx = cx;   // inline formulas met while rendering start their batch on it
+    // Only rows within a screen of the view are built (spacer() stands in for the
+    // rest), so a long paper scrolls as fast as a short one.
+    // During a long glide the rows where it started stay built too, so the slide shows text.
+    const vh = this.viewH || 1200;   // before the first size report, a screen's guess
+    if (this.drawnOffset !== undefined && this.motion > 0 && Math.abs(this.drawnOffset - this.offset) > vh) { this.glideFrom = this.drawnOffset; this.glideEnd = Date.now() + this.motion; }
+    else if (Date.now() > (this.glideEnd ?? 0)) this.glideFrom = undefined;
+    this.drawnOffset = this.offset;
+    const around = (y, h, o) => y + h > o - vh && y < o + 2 * vh;
+    this.near = []; for (let i = 0, y = TOP; i < this.blocks.length; i++) {
+      if (this.hidden[i]) continue;
+      const h = this.heights[i] ?? ROW_GUESS;
+      this.near[i] = around(y, h, this.offset) || (this.glideFrom !== undefined && around(y, h, this.glideFrom)); y += h;
+    }
     const t = theme();
     if (this.figTokens && !this.figBusy && this.figTheme() !== this.figSig) {
       this.figSig = this.figTheme(); this.figBusy = true;
@@ -1849,6 +2053,11 @@ export default class Md extends View {
       .child(div().id("md-view").flex_1().min_h(0).relative().overflow_hidden()
         .on_size_change((size, cx) => { this.viewH = size.height / Z(); this.viewW = size.width / Z(); if (this.zoom) this.clampZoom(); this.offset = this.clamp(this.offset); this.reaim(); cx.notify(); })
         .on_scroll_wheel((e, cx) => { if (!this.zoom) this.scrollBy(-e.delta.y / Z(), cx); })
+        .on_mouse_move((e, cx) => { if (this.barDrag) this.dragBar(e, thumbH, cx); })
+        .on_mouse_up("left", (_e, cx) => { if (this.barDrag) { this.barDrag = null; cx.notify(); } })
+        // A release outside the pane never reaches it, so leaving the pane ends a drag.
+        .on_hover((hovered, cx) => { if (!hovered && this.barDrag) { this.barDrag = null; cx.notify(); } })
+        .on_mouse_down("left", () => { this.barDrag = null; })
         .child(div().id("md-content").absolute().left(0).w_full().top(-this.offset)
           .transition("top", { duration: this.motion, easing: this.motion === GLIDE ? "ease-in-out" : "ease-out" })
           .on_size_change((size, cx) => { this.contentH = size.height / Z(); this.reaim(); cx.notify(); })
@@ -1856,10 +2065,14 @@ export default class Md extends View {
             .child(v_flex().id("md-col").w_full().max_w(MAX_W).px(PAD).pt(TOP).pb(80)
               .on_size_change((size, cx) => { const w = Math.max(120, size.width / Z() - PAD * 2); if (Math.abs(w - this.colW) > 1) { this.colW = w; this.resizeVideos(); cx.notify(); } }).font_family(BODY()).text_size(SIZE.body).line_height(1.65)
               .when(Boolean(this.error), el => el.child(div().text_color(t.blocked).child(this.error)))
-              .children(this.blocks.map((tok, i) => this.row(tok, i, t)))
+              .children(this.blocks.map((tok, i) => this.near[i] ? this.row(tok, i, t) : this.spacer(tok, i)))
               .when(this.removed.has(this.blocks.length), el => el.child(this.removedMark(this.removed.get(this.blocks.length), t))))))
         .when(!this.file && !this.error, el => el.child(this.emptyState(t)))
-        .when(thumbH > 0, el => el.child(div().absolute().right(3).w(6).rounded(3).bg(t.border).top(thumbY).h(thumbH).transition("top", { duration: this.motion, easing: "ease-out" })))
+        .when(thumbH > 0, el => el.child(div().id("md-bar").absolute().top(0).right(0).w(14).h_full()
+          .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.grabBar(e, thumbH, thumbY, cx); })
+          .on_mouse_up("left", (_e, cx) => { this.barDrag = null; cx.notify(); })
+          .child(div().absolute().right(3).w(this.barDrag ? 8 : 6).rounded(4).bg(this.barDrag ? t.muted : t.border).hover(s => s.bg(t.muted))
+            .top(thumbY).h(thumbH).transition("top", { duration: this.motion, easing: "ease-out" }))))
         .when(this.outline, el => el.child(this.outlinePanel(t)))
         .when(Boolean(this.zoom), el => el.child(this.zoomPanel(t)))
         .when(this.help, el => el.child(this.helpPanel(t)))

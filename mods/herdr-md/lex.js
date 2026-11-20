@@ -9,11 +9,32 @@
 // boundary and says so (capSource()).
 import { marked } from "./marked.js";
 
-// $$…$$ display math as its own block (single- or multi-line).
+const MATH_OPEN = /(^|\n) {0,3}\$\$/;
+
+// $$…$$ display math as its own block: one line that is all math, or a $$ line
+// alone that opens a block closed by a later $$. Anything else, such as $$…$$ in
+// a sentence or wrapped across lines, is inline math (as on GitHub); taking it
+// here would pair its closer with the next block's opener.
 marked.use({ extensions: [{
   name: "math", level: "block",
-  start(src) { const i = src.indexOf("$$"); return i < 0 ? undefined : i; },
-  tokenizer(src) { const m = /^\$\$([\s\S]+?)\$\$[^\S\n]*(?:\n|$)/.exec(src); if (m) return { type: "math", raw: m[0], text: m[1].trim() }; },
+  start(src) { const m = MATH_OPEN.exec(src); return m ? m.index + m[1].length : undefined; },
+  tokenizer(src) {
+    const m = /^ {0,3}\$\$([^\n]+?)\$\$[^\S\n]*(?:\n|$)/.exec(src) ?? /^ {0,3}\$\$[^\S\n]*\n([\s\S]*?)\$\$[^\S\n]*(?:\n|$)/.exec(src);
+    if (m) return { type: "math", raw: m[0], text: m[1].trim() };
+  },
+}] });
+// GitHub footnote definitions: `[^id]: text`, continued by indented lines (a
+// blank line may sit between them). The reference `[^id]` is linked in doc.js.
+const NOTE_OPEN = /(^|\n) {0,3}\[\^[^\]\s]+\]:/;
+marked.use({ extensions: [{
+  name: "footnote", level: "block",
+  start(src) { const m = NOTE_OPEN.exec(src); return m ? m.index + m[1].length : undefined; },
+  tokenizer(src) {
+    const m = /^ {0,3}\[\^([^\]\s]+)\]:[^\n]*(?:\n(?:[^\S\n]*\n)*(?: {4}|\t)[^\n]*)*(?:\n|$)/.exec(src);
+    if (!m) return;
+    const text = m[0].replace(/^ {0,3}\[\^[^\]]+\]:[^\S\n]*/, "").split("\n").map(l => l.replace(/^(?: {4}|\t)/, "")).join("\n").trim();
+    return { type: "footnote", raw: m[0], id: m[1], text };
+  },
 }] });
 export { marked };
 
@@ -55,8 +76,8 @@ export function* boundaries(text) {
       if (f && !(f[1][0] === "`" && l.slice(f[0].length).includes("`"))) fence = f[1];
       else {
         let end = -1;
-        const d = l.indexOf("$$");
-        if (d >= 0) end = mathEnd(pos + d + 2);
+        const d = /^ {0,3}\$\$[^\S\n]*$/.exec(l);
+        if (d) end = mathEnd(pos + d[0].length);
         const c = l.indexOf("<!--");
         if (c >= 0) { const e = text.indexOf("-->", pos + c + 4); if (e > end) end = e; }
         const h = RAW_HTML.exec(l);

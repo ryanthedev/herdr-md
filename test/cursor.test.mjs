@@ -13,10 +13,12 @@ test("C and B cycle through every option and wrap", () => {
 });
 
 test("a missing or bad saved choice falls back to the defaults", () => {
-  assert.deepEqual(parseCursorPref('{"look":"bar"}'), { look: "highlight", motion: "blink number" });   // the bar look is gone
-  assert.deepEqual(parseCursorPref(null), { look: "highlight", motion: "blink number" });
-  assert.deepEqual(parseCursorPref("{nope"), { look: "highlight", motion: "blink number" });
-  assert.deepEqual(parseCursorPref('{"look":"zap","motion":"blink both"}'), { look: "highlight", motion: "blink both" });
+  const d = { look: "highlight", motion: "blink number", numbers: "absolute" };
+  assert.deepEqual(parseCursorPref('{"look":"bar"}'), d);   // the bar look is gone
+  assert.deepEqual(parseCursorPref(null), d);
+  assert.deepEqual(parseCursorPref("{nope"), d);
+  assert.deepEqual(parseCursorPref('{"look":"zap","motion":"blink both","numbers":"wide"}'), { ...d, motion: "blink both" });
+  assert.deepEqual(parseCursorPref('{"numbers":"off"}'), { ...d, numbers: "off" });
 });
 
 test("every look still shows a cursor with numbers off", () => {

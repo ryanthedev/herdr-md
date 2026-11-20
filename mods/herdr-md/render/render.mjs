@@ -32,13 +32,32 @@ async function math(job) {
     const doc = mathjax.document("", { InputJax: new TeX({ packages: AllPackages }), OutputJax: new SVG({ fontCache: "none" }) });
     tex = (src, display) => adaptor.innerHTML(doc.convert(src, { display }));
   }
-  let svg = tex(job.src, job.display !== false);
+  let svg = tex(job.src, !job.inline && job.display !== false);
   if (/data-mjx-error|merror/.test(svg)) throw new Error("TeX error");
   svg = svg.replace(/currentColor/g, job.color || "#c0caf5");
   if (!/xmlns=/.test(svg)) svg = svg.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
+  if (job.inline) return inlineSvg(job, svg);
   fs.writeFileSync(job.out, svg);
   // ~9.5px per ex at the viewer's 19px display-math size.
   return svgSize(svg, job.exPx || 9.5);
+}
+
+// Inline math sits in a line of text, which centers an image on the line
+// (`center` px above the baseline). Pad the SVG so its baseline lands on the
+// text's, and size it in px.
+function inlineSvg(job, svg) {
+  const exPx = job.exPx || 7.5, { w, h } = svgSize(svg, exPx);
+  const depth = +(svg.match(/vertical-align:\s*(-?[\d.]+)ex/)?.[1] ?? 0) * -exPx;
+  const vb = svg.match(/viewBox="([-\d.]+) ([-\d.]+) ([-\d.]+) ([-\d.]+)"/).slice(1).map(Number);
+  const unit = vb[3] / h, above = h - depth, center = job.center ?? exPx * 0.66;
+  // Centered, the image's middle is at `center`: above - center must equal half its height.
+  const top = Math.max(0, h - 2 * (above - center)), bottom = Math.max(0, 2 * (above - center) - h);
+  const H = h + top + bottom;
+  svg = svg.replace(/viewBox="[^"]*"/, `viewBox="${vb[0]} ${vb[1] - top * unit} ${vb[2]} ${H * unit}"`)
+    .replace(/width="[\d.]+ex"/, `width="${w}"`).replace(/height="[\d.]+ex"/, `height="${H}"`)
+    .replace(/ style="[^"]*"/, "");
+  fs.writeFileSync(job.out, svg);
+  return { w, h: H };
 }
 
 // ---- mermaid ----
