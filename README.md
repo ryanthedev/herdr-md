@@ -88,6 +88,44 @@ mdh open README.md                  # a viewer to the right of the focused pane
 
 or from any script: `herdr-app do pane.split '{"direction":"right","mod":"herdr-md","props":{"file":"/abs/path.md"}}'`.
 
+### Ctrl-click a path in a terminal
+
+Ctrl-click (Cmd-click on macOS) a `.md`, `.markdown` or `.mdx` path that an
+agent or a command printed, and it opens in a viewer to the right of that
+terminal. The tab's viewer is reused, and `Backspace` goes back.
+
+It uses Herdr's [terminal link handlers](https://github.com/herdrdev/herdr-app),
+which only work on a layout of your own. Herdr's shipped layouts are read-only,
+so if you're on one, clone it:
+
+```sh
+herdr-app do layout.clone '{"name":"main","as":"my-main"}'
+```
+
+Herdr adds `herdr-md` to the layout's `link_handlers` the first time it sees the
+rule on a layout of yours (upgrading herdr-md does this too, if you already have
+one). Check the root of `layouts/my-main.json`, and add it if it isn't there:
+
+```json
+"link_handlers": ["herdr-md"]
+```
+
+Handlers run in that order, so put one that should win before it. **To turn this
+off,** remove `herdr-md` from the list; Herdr doesn't add it back.
+
+- Paths can be absolute, relative to the terminal's current folder, start with
+  `~/`, `$HOME/` or `$PWD/`, or be `file://` URIs, inside the project or not.
+  Punctuation after a path and `:line`, `#L5` or `#section` suffixes are ignored
+  (the viewer opens at the top).
+- Web links, other files and clicks in terminals on another machine keep Herdr's
+  usual behavior. A Markdown path with no file behind it shows a notification.
+- A zoomed terminal is unzoomed so the document can be seen. A tab with several
+  viewers gets one more, because a click can't say which one to use.
+- Herdr decides what in the terminal is a link. It skips bare file names
+  (`README.md`; `./README.md` works) and may cut a plain path at a space or a
+  comma: `file://` URIs with `%20` are safe.
+- A handler runs `test` and `realpath` on the clicked path, nothing else.
+
 ### Or start in the picker
 
 ```sh

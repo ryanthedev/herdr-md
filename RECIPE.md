@@ -35,6 +35,10 @@ on the person's PATH, since opening files and every agent feature go through it:
 - Keys (with `"focusable": true`): `j/k` (counts), `gg/G`, `ctrl-d/u/f/b`, `space`, `{ }`/`[ ]`, `zz`, `za/zc/zo/zM/zR`, `V`, `y` (copy source via `pbcopy`), `p` (pin: write `~/.cache/herdr-md/selection.json`), `Enter` (fold a heading or follow its first link), `/` search with `Enter`/`Shift-Enter`, `n/N`, `#`, `C`, `B`, `Esc`. A click puts the cursor on that block; clicking a heading folds it.
 - Figures render in one batch per load through `node render/render.mjs '<jobs JSON>'`; the first time, the mod runs `npm install` there. Outputs are cached by a hash of source and colors, so a theme change re-renders once.
 
+## Terminal links
+
+Ctrl-click (Cmd-click on macOS) a Markdown path in a terminal and it opens in a viewer to the right of that terminal, or in the tab's only viewer through `herdr-md.open`. `mod.json` declares a `file` link rule for `.md`, `.markdown` and `.mdx` that tolerates trailing punctuation and `:line` / `#anchor` suffixes; `link.js` exports `handleLink` and passes Herdr's functions to `link-open.js` (no Herdr imports, tested by `test/link.test.mjs`). It tries `link.path`, then the raw text with punctuation and suffixes stripped, resolved against `source.cwd` and the home folder, and takes the first that `test -f` accepts. Remote terminals and `file:` URIs naming another host return `"pass"`. A zoom that would hide the viewer is ended first. With several viewers it splits another and never closes one. Only layouts that aren't shipped run link handlers.
+
 ## Built from
 
 - `mods/herdr-md/main.js`: one `View`. Parses with vendored `marked` (`marked.js`) plus a block extension for `$$…$$`; top-level tokens (lists split into one block per item) become rows, each measured with `on_size_change` to place the viewport.
@@ -58,6 +62,7 @@ on the person's PATH, since opening files and every agent feature go through it:
 
 ## Done when
 
+- On a layout of your own, Ctrl-click `docs/file.md.` printed in a terminal: a viewer opens to the right. Ctrl-click another Markdown path: the same viewer shows it. A web link ending in `.md` still opens in the browser.
 - A README with headings, a table, a code block and an image renders with real sizes and theme colors, and the image fits a narrow pane.
 - `$$\hat{y} = w_1 x_1 + b$$` shows typeset subscripts; inline `$\mathbf{x}^{(i)}$` shows `x⁽ⁱ⁾`; `$5 and $10` stays text.
 - A ` ```mermaid ` flowchart renders as a picture.
